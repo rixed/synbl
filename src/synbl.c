@@ -21,13 +21,28 @@
 #include <stdio.h>
 #include <junkie/cpp.h>
 #include <junkie/proto/proto.h>
+#include <junkie/tools/cli.h>
+
+static unsigned opt_max_syn   = 1;
+static unsigned opt_period    = 1;
+static unsigned opt_probation = 5 * 60;
+
+static struct cli_opt options[] = {
+    { { "max-syn",   NULL }, true, "blacklist if the number of SYN per sampling period exceeds this", CLI_SET_UINT, { .uint = &opt_max_syn } },
+    { { "period",    NULL }, true, "Duration (in seconds) of the sampling period",                    CLI_SET_UINT, { .uint = &opt_period } },
+    { { "probation", NULL }, true, "Duration (in seconds) of the blacklist",                          CLI_SET_UINT, { .uint = &opt_probation } },
+};
 
 void on_load(void)
 {
 	SLOG(LOG_DEBUG, "Loading synbl");
+
+    (void)cli_register("synbl", options, NB_ELEMS(options));
 }
 
 void on_unload(void)
 {
 	SLOG(LOG_DEBUG, "Unloading synbl");
+
+    (void)cli_unregister(options);
 }
