@@ -23,6 +23,9 @@
 #include <inttypes.h>
 #include <junkie/cpp.h>
 #include <junkie/proto/proto.h>
+#include <junkie/proto/tcp.h>
+#include <junkie/proto/ip.h>
+#include <junkie/proto/cap.h>
 #include <junkie/tools/cli.h>
 #include <junkie/tools/hash.h>
 #include <junkie/tools/ip_addr.h>
@@ -53,26 +56,30 @@ struct syner {
 
 static HASH_TABLE(syners, syner) syners;
 
-static int syner_ctor(struct syner *syner, struct ip_addr const *ip, uint16_t dport)
+static void syner_key_ctor(struct syner_key *key, struct ip_addr const *ip, uint16_t dport)
 {
-    SLOG(LOG_DEBUG, "Constructing new syner@%p for %s, dport %"PRIu16, syner, ip_addr_2_str(ip), dport);
+    memset(key, 0, sizeof(*key));
+    key->ip = *ip;
+    key->dport = dport;
+}
 
-    memset(syner.key, 0, sizeof(syner.key));    // because we will memcmp keys
-    syner->key.ip = *ip;
-    syner->key.dport = dport;
+static int syner_ctor(struct syner *syner, struct syner_key const *key)
+{
+    SLOG(LOG_DEBUG, "Constructing new syner@%p for %s, dport %"PRIu16, syner, ip_addr_2_str(&key->ip), key->dport);
 
+    syner->key = *key;
     HASH_INSERT(&syners, syner, &syner->key, entry);
 
     return 0;
 }
 
-static struct syner *syner_new(struct ip_addr const *ip, uint16_t dport)
+static struct syner *syner_new(struct syner_key const *key)
 {
     MALLOCER(syners);
     struct syner *syner = MALLOC(syners, sizeof(*syner));
     if (! syner) return NULL;
 
-    if (0 != syner_ctor(syner, ip, dport)) {
+    if (0 != syner_ctor(syner, key)) {
         FREE(syner);
         return NULL;
     }
@@ -91,6 +98,41 @@ static void syner_del(struct syner *syner)
     FREE(syner);
 }
 
+/*
+ * Packet callback
+ */
+
+// This function is called once for each captured packet
+int parse_callback(struct proto_info const *info, size_t unused_ cap_len, uint8_t const unused_ *packet)
+{
+    // We need tcp (a SYN), ip and capture infos to proceed (capture is needed for timestamp)
+    ASSIGN_INFO_CHK(tcp, info, 0);
+    if (! tcp->syn) return 0;
+    ASSIGN_INFO_CHK2(ip, ip6, &tcp->info, 0);    // ip or ip6 is OK
+    if (! ip) ip = ip6;                         // but from now on, we use "ip"
+    ASSIGN_INFO_CHK(cap, &ip->info, 0);
+
+    // So we have a syner. Look it up this syners hash
+    struct syner_key key;
+    syner_key_ctor(&key, ip->key.addr+0, tcp->key.port[1]);
+
+    struct syner *syner;
+    HASH_LOOKUP(syner, &syners, &key, key, entry);
+
+    if (! syner) {
+        syner = syner_new(&key);
+        if (! syner) return 0;
+    }
+
+    // Now do something with this syner
+    // ...
+
+    return 0;
+}
+
+/*
+ * Init
+ */
 
 void on_load(void)
 {
