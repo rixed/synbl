@@ -1,6 +1,6 @@
 SUBDIRS = src
 
-.PHONY: cscope clear
+.PHONY: cscope clear config
 
 cscope:
 	cd $(top_srcdir) && cscope -Rb $(CPPFLAGS)
