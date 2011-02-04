@@ -57,7 +57,7 @@ struct syner {
         struct ip_addr ip;
         uint16_t dport;
     } key;
-    // ...
+    unsigned nb_syns;
 };
 
 static HASH_TABLE(syners, syner) syners;
@@ -74,6 +74,8 @@ static int syner_ctor(struct syner *syner, struct syner_key const *key)
     SLOG(LOG_DEBUG, "Constructing new syner@%p for %s, dport %"PRIu16, syner, ip_addr_2_str(&key->ip), key->dport);
 
     syner->key = *key;
+    syner->nb_syns = 0;
+
     HASH_INSERT(&syners, syner, &syner->key, entry);
 
     return 0;
@@ -124,6 +126,22 @@ static void syners_del_all(void)
  * Packet callback
  */
 
+static void *blacklist(void *key_)
+{
+    struct syner_key *key = key_;
+
+    char const *ip = ip_addr_2_str(&key->ip);
+    SLOG(LOG_DEBUG, "Banning IP %s", ip);
+
+    SCM synbl_module = scm_c_resolve_module("junkie synbl");
+    SCM var = scm_c_module_lookup(synbl_module, "synbl-ban");
+    SCM ban_proc = scm_variable_ref(var);
+
+    (void)scm_call_2(ban_proc, scm_from_locale_string(ip), scm_from_uint16(key->dport));
+
+    return (void *)1;
+}
+
 // This function is called once for each captured packet
 int parse_callback(struct proto_info const *info, size_t unused_ cap_len, uint8_t const unused_ *packet)
 {
@@ -146,8 +164,9 @@ int parse_callback(struct proto_info const *info, size_t unused_ cap_len, uint8_
 
     if (! syner) return 0;
 
-    // Now do something with this syner
-    // ...
+    if (++ syner->nb_syns > opt_max_syn) {
+        scm_with_guile(blacklist, &syner->key);
+    }
 
     return 0;
 }
