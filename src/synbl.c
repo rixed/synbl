@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <junkie/cpp.h>
 #include <junkie/proto/proto.h>
 #include <junkie/proto/tcp.h>
@@ -30,6 +31,7 @@
 #include <junkie/tools/hash.h>
 #include <junkie/tools/ip_addr.h>
 #include <junkie/tools/mallocer.h>
+#include <junkie/tools/mutex.h>
 
 static unsigned opt_max_syn   = 1;
 static unsigned opt_period    = 1;
@@ -40,6 +42,10 @@ static struct cli_opt options[] = {
     { { "period",    NULL }, true, "Duration (in seconds) of the sampling period",                    CLI_SET_UINT, { .uint = &opt_period } },
     { { "probation", NULL }, true, "Duration (in seconds) of the blacklist",                          CLI_SET_UINT, { .uint = &opt_probation } },
 };
+
+static struct mutex synbl_lock; // protects access to quit and syners
+static pthread_t clearer_pth;
+static bool quit;
 
 /*
  * A syner is a client IP and a target port, corresponding to a TCP SYN we have seen.
@@ -75,6 +81,8 @@ static int syner_ctor(struct syner *syner, struct syner_key const *key)
 
 static struct syner *syner_new(struct syner_key const *key)
 {
+    PTHREAD_ASSERT_LOCK(&synbl_lock.mutex);
+
     MALLOCER(syners);
     struct syner *syner = MALLOC(syners, sizeof(*syner));
     if (! syner) return NULL;
@@ -89,13 +97,27 @@ static struct syner *syner_new(struct syner_key const *key)
 
 static void syner_dtor(struct syner *syner)
 {
+    SLOG(LOG_DEBUG, "Destructing syner@%p", syner);
+
     HASH_REMOVE(&syners, syner, entry);
 }
 
 static void syner_del(struct syner *syner)
 {
+    PTHREAD_ASSERT_LOCK(&synbl_lock.mutex);
     syner_dtor(syner);
     FREE(syner);
+}
+
+static void syners_del_all(void)
+{
+    // Deletes every syners
+    mutex_lock(&synbl_lock);
+    struct syner *syner, *tmp;
+    HASH_FOREACH_SAFE(syner, &syners, entry, tmp) {
+        syner_del(syner);
+    }
+    mutex_unlock(&synbl_lock);
 }
 
 /*
@@ -116,18 +138,35 @@ int parse_callback(struct proto_info const *info, size_t unused_ cap_len, uint8_
     struct syner_key key;
     syner_key_ctor(&key, ip->key.addr+0, tcp->key.port[1]);
 
+    mutex_lock(&synbl_lock);
     struct syner *syner;
     HASH_LOOKUP(syner, &syners, &key, key, entry);
+    if (! syner) syner = syner_new(&key);
+    mutex_unlock(&synbl_lock);
 
-    if (! syner) {
-        syner = syner_new(&key);
-        if (! syner) return 0;
-    }
+    if (! syner) return 0;
 
     // Now do something with this syner
     // ...
 
     return 0;
+}
+
+/*
+ * Clearer thread
+ * this thread clears all syners that survived a sampling period
+ */
+
+static void *clearer_thread(void unused_ *dummy)
+{
+    set_thread_name("J-synbl-clearer");
+
+    while (! quit) {
+        sleep(opt_period);
+        syners_del_all();
+    }
+
+    return NULL;
 }
 
 /*
@@ -138,21 +177,31 @@ void on_load(void)
 {
 	SLOG(LOG_DEBUG, "Loading synbl");
 
+    mutex_ctor(&synbl_lock, "synbl");
+
     (void)cli_register("synbl", options, NB_ELEMS(options));
 
     HASH_INIT(&syners, 1000, "syners");
+
+    if (0 != pthread_create(&clearer_pth, NULL, clearer_thread, NULL)) {
+        SLOG(LOG_ERR, "Cannot start clearer thread");
+        // I'd rather like to return an error code in this situation
+    }
 }
 
 void on_unload(void)
 {
 	SLOG(LOG_DEBUG, "Unloading synbl");
 
-    // Deletes every syners
-    struct syner *syner, *tmp;
-    HASH_FOREACH_SAFE(syner, &syners, entry, tmp) {
-        syner_del(syner);
-    }
+    mutex_lock(&synbl_lock);
+    quit = true;
+    mutex_unlock(&synbl_lock);
+    (void)pthread_join(clearer_pth, NULL);
+
+    syners_del_all();
     HASH_DEINIT(&syners);
 
     (void)cli_unregister(options);
+
+    mutex_dtor(&synbl_lock);
 }
