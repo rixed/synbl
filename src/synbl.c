@@ -48,13 +48,14 @@ static struct cli_opt options[] = {
     { { "probation", NULL }, true, "duration (in seconds) of the blacklist",                          CLI_SET_UINT, { .uint = &opt_probation } },
 };
 
-static struct mutex synbl_lock; // protects access to quit and syners
-static pthread_t clearer_pth;
+static struct mutex synbl_lock; // protects access to quit, syners and siners
+static pthread_t clearer_pth, forgiver_pth;
 static bool quit;
 
 LOG_CATEGORY_DEF(synbl)
 #undef LOG_CAT
 #define LOG_CAT synbl_log_category
+
 /*
  * A syner is a client IP and a target port, corresponding to a TCP SYN we have seen.
  */
@@ -133,23 +134,99 @@ static void syners_del_all(void)
 }
 
 /*
+ * A siner is a syner that have commited the sin of sending too much SYNs
+ * and have been blacklisted.
+ */
+
+struct siner {
+    TAILQ_ENTRY(siner) entry;   // entry in siners list
+    struct syner_key key;
+    struct timeval bl;
+};
+
+static TAILQ_HEAD(siners, siner) siners;    // sorted in least recently blacklisted first
+
+static int siner_ctor(struct siner *siner, struct syner_key const *key)
+{
+    SLOG(LOG_DEBUG, "Constructing new siner@%p for %s, dport %"PRIu16, siner, ip_addr_2_str(&key->ip), key->dport);
+
+    siner->key = *key;
+    timeval_set_now(&siner->bl);
+    TAILQ_INSERT_TAIL(&siners, siner, entry);
+
+    return 0;
+}
+
+static struct siner *siner_new(struct syner_key const *key)
+{
+    PTHREAD_ASSERT_LOCK(&synbl_lock.mutex);
+
+    MALLOCER(siners);
+    struct siner *siner = MALLOC(siners, sizeof(*siner));
+    if (! siner) return NULL;
+
+    if (0 != siner_ctor(siner, key)) {
+        FREE(siner);
+        return NULL;
+    }
+
+    return siner;
+}
+
+static void siner_dtor(struct siner *siner)
+{
+    SLOG(LOG_DEBUG, "Destructing siner@%p", siner);
+
+    TAILQ_REMOVE(&siners, siner, entry);
+}
+
+static void siner_del(struct siner *siner)
+{
+    PTHREAD_ASSERT_LOCK(&synbl_lock.mutex);
+    siner_dtor(siner);
+    FREE(siner);
+}
+
+static void siners_del_all(void)
+{
+    SLOG(LOG_DEBUG, "Deleting all siners");
+
+    // Deletes every siners
+    mutex_lock(&synbl_lock);
+    struct siner *siner;
+    while (NULL != (siner = TAILQ_FIRST(&siners))) {
+        siner_del(siner);
+        // Notice that blacklisted siners stay blacklisted
+    }
+    mutex_unlock(&synbl_lock);
+}
+
+/*
  * Packet callback
  */
 
-static void *blacklist(void *key_)
+static void *call_f(char const *func, struct syner_key *key)
 {
-    struct syner_key *key = key_;
-
     char const *ip = ip_addr_2_str(&key->ip);
-    SLOG(LOG_DEBUG, "Banning IP %s", ip);
+    SLOG(LOG_DEBUG, "Calling %s for IP %s", func, ip);
 
     SCM synbl_module = scm_c_resolve_module("junkie synbl");
-    SCM var = scm_c_module_lookup(synbl_module, "synbl-ban");
-    SCM ban_proc = scm_variable_ref(var);
+    SCM var = scm_c_module_lookup(synbl_module, func);
+    SCM proc = scm_variable_ref(var);
 
-    (void)scm_call_2(ban_proc, scm_from_locale_string(ip), scm_from_uint16(key->dport));
+    (void)scm_call_2(proc, scm_from_locale_string(ip), scm_from_uint16(key->dport));
 
     return (void *)1;
+}
+
+static void *ban(void *key_)
+{
+    return call_f("synbl-ban", key_);
+}
+
+static void *unban(void *key_)
+{
+    return call_f("synbl-unban", key_);
 }
 
 // This function is called once for each captured packet
@@ -179,7 +256,11 @@ int parse_callback(struct proto_info const *info, size_t unused_ cap_len, uint8_
     EXT_UNLOCK(opt_max_syn);
 
     if (++ syner->nb_syns > max_syn) {
-        scm_with_guile(blacklist, &syner->key);
+        scm_with_guile(ban, &syner->key);
+        mutex_lock(&synbl_lock);
+        (void)siner_new(&syner->key);
+        syner_del(syner);   // Avoid retrigering the blacklisting at next SYN (just in case blacklisting will not be effective enough)
+        mutex_unlock(&synbl_lock);
     }
 
     return 0;
@@ -206,6 +287,40 @@ static void *clearer_thread(void unused_ *dummy)
 }
 
 /*
+ * Forgiver thread
+ * this thread removes clients from blacklist once their probation period has expired
+ */
+
+static void *forgiver_thread(void unused_ *dummy)
+{
+    set_thread_name("J-synbl-forgiver");
+
+    while (! quit) {
+        EXT_LOCK(opt_probation);
+        int_least64_t const probation = opt_probation * 1000000LL;
+        EXT_UNLOCK(opt_probation);
+
+        struct timeval now;
+        timeval_set_now(&now);
+
+        mutex_lock(&synbl_lock);
+        struct siner *siner;
+        while (NULL != (siner = TAILQ_FIRST(&siners))) {
+            int64_t const age = timeval_sub(&now, &siner->bl);
+            if (age < probation) break;
+            SLOG(LOG_DEBUG, "Probation of %"PRIdLEAST64"us expired for %s", probation, ip_addr_2_str(&siner->key.ip));
+            scm_with_guile(unban, &siner->key);
+            siner_del(siner);
+        }
+        mutex_unlock(&synbl_lock);
+
+        sleep(1);
+    }
+
+    return NULL;
+}
+
+/*
  * Init
  */
 
@@ -223,10 +338,14 @@ void on_load(void)
     (void)cli_register("synbl", options, NB_ELEMS(options));
 
     HASH_INIT(&syners, 1000, "syners");
+    TAILQ_INIT(&siners);
 
     if (0 != pthread_create(&clearer_pth, NULL, clearer_thread, NULL)) {
         SLOG(LOG_ERR, "Cannot start clearer thread");
         // I'd rather like to return an error code in this situation
+    }
+    if (0 != pthread_create(&forgiver_pth, NULL, forgiver_thread, NULL)) {
+        SLOG(LOG_ERR, "Cannot start forgiver thread");
     }
 }
 
@@ -238,7 +357,9 @@ void on_unload(void)
     quit = true;
     mutex_unlock(&synbl_lock);
     (void)pthread_join(clearer_pth, NULL);
+    (void)pthread_join(forgiver_pth, NULL);
 
+    siners_del_all();
     syners_del_all();
     HASH_DEINIT(&syners);
 

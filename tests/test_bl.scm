@@ -42,5 +42,8 @@ exec junkie -c $0
 (sleep 1)
 (assert (equal? 1 (hash-table-size blacklist)))
 (assert (hash-table-exists? blacklist (cons "192.168.10.9" 22)))
+; wait more for probation period
+(sleep 4)
+(assert (equal? 0 (hash-table-size blacklist)))
 
 (exit)
