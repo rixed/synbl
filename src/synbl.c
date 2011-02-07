@@ -32,21 +32,29 @@
 #include <junkie/tools/ip_addr.h>
 #include <junkie/tools/mallocer.h>
 #include <junkie/tools/mutex.h>
+#include <junkie/tools/ext.h>
 
 static unsigned opt_max_syn   = 1;
 static unsigned opt_period    = 1;
 static unsigned opt_probation = 5 * 60;
 
+EXT_PARAM_RW(opt_max_syn,   "max-syn",   uint, "blacklist if the number of SYN per sampling period exceeds this");
+EXT_PARAM_RW(opt_period,    "period",    uint, "duration (in seconds) of the sampling period");
+EXT_PARAM_RW(opt_probation, "probation", uint, "duration (in seconds) of the blacklist");
+
 static struct cli_opt options[] = {
     { { "max-syn",   NULL }, true, "blacklist if the number of SYN per sampling period exceeds this", CLI_SET_UINT, { .uint = &opt_max_syn } },
-    { { "period",    NULL }, true, "Duration (in seconds) of the sampling period",                    CLI_SET_UINT, { .uint = &opt_period } },
-    { { "probation", NULL }, true, "Duration (in seconds) of the blacklist",                          CLI_SET_UINT, { .uint = &opt_probation } },
+    { { "period",    NULL }, true, "duration (in seconds) of the sampling period",                    CLI_SET_UINT, { .uint = &opt_period } },
+    { { "probation", NULL }, true, "duration (in seconds) of the blacklist",                          CLI_SET_UINT, { .uint = &opt_probation } },
 };
 
 static struct mutex synbl_lock; // protects access to quit and syners
 static pthread_t clearer_pth;
 static bool quit;
 
+LOG_CATEGORY_DEF(synbl)
+#undef LOG_CAT
+#define LOG_CAT synbl_log_category
 /*
  * A syner is a client IP and a target port, corresponding to a TCP SYN we have seen.
  */
@@ -113,6 +121,8 @@ static void syner_del(struct syner *syner)
 
 static void syners_del_all(void)
 {
+    SLOG(LOG_DEBUG, "Deleting all syners");
+
     // Deletes every syners
     mutex_lock(&synbl_lock);
     struct syner *syner, *tmp;
@@ -164,7 +174,11 @@ int parse_callback(struct proto_info const *info, size_t unused_ cap_len, uint8_
 
     if (! syner) return 0;
 
-    if (++ syner->nb_syns > opt_max_syn) {
+    EXT_LOCK(opt_max_syn);
+    unsigned const max_syn = opt_max_syn;
+    EXT_UNLOCK(opt_max_syn);
+
+    if (++ syner->nb_syns > max_syn) {
         scm_with_guile(blacklist, &syner->key);
     }
 
@@ -181,7 +195,10 @@ static void *clearer_thread(void unused_ *dummy)
     set_thread_name("J-synbl-clearer");
 
     while (! quit) {
-        sleep(opt_period);
+        EXT_LOCK(opt_period);
+        unsigned const period = opt_period;
+        EXT_UNLOCK(opt_period);
+        sleep(period);
         syners_del_all();
     }
 
@@ -194,7 +211,12 @@ static void *clearer_thread(void unused_ *dummy)
 
 void on_load(void)
 {
-	SLOG(LOG_DEBUG, "Loading synbl");
+    log_category_synbl_init();
+    SLOG(LOG_DEBUG, "Loading synbl");
+
+    ext_param_opt_max_syn_init();
+    ext_param_opt_period_init();
+    ext_param_opt_probation_init();
 
     mutex_ctor(&synbl_lock, "synbl");
 
@@ -210,7 +232,7 @@ void on_load(void)
 
 void on_unload(void)
 {
-	SLOG(LOG_DEBUG, "Unloading synbl");
+    SLOG(LOG_DEBUG, "Unloading synbl");
 
     mutex_lock(&synbl_lock);
     quit = true;
@@ -223,4 +245,9 @@ void on_unload(void)
     (void)cli_unregister(options);
 
     mutex_dtor(&synbl_lock);
+
+    ext_param_opt_probation_fini();
+    ext_param_opt_period_fini();
+    ext_param_opt_max_syn_fini();
+    log_category_synbl_fini();
 }
